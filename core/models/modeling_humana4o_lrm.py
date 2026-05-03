@@ -104,6 +104,26 @@ def pad_to_ratio(tensor: torch.Tensor, target_ratio: float) -> tuple:
     return padded_tensor, (left_pad, top_pad, W + left_pad, H + top_pad)
 
 
+def _gs_alpha_to_2d(mask) -> np.ndarray:
+    """Normalise the gsplat comp_mask -- which arrives as (B, V, H, W),
+    (H, W, 1), or (H, W) depending on the renderer code path -- into a
+    plain (H, W) float32 array clipped to [0, 1] so the caller can resize
+    and place it without per-call shape juggling.
+    """
+    if hasattr(mask, "detach"):
+        mask = mask.detach().cpu().numpy()
+    a = np.asarray(mask, dtype=np.float32)
+    while a.ndim > 2 and a.shape[0] == 1:
+        a = a[0]
+    while a.ndim > 2 and a.shape[-1] == 1:
+        a = a[..., 0]
+    if a.ndim != 2:
+        raise ValueError(
+            f"_gs_alpha_to_2d: cannot reduce shape {a.shape} to (H, W)"
+        )
+    return np.clip(a, 0.0, 1.0)
+
+
 class ModelHumanA4OLRM(nn.Module):
     """
     ModelHumanA4OLRM
@@ -1059,6 +1079,7 @@ class ModelHumanA4OLRM(nn.Module):
         offset_list=None,
         mask_seqs=None,
         output_rgb=None,
+        return_gs_alpha=False,
     ):
         """
         Perform animation inference for Gaussian Splatting-based human rendering.
@@ -1098,6 +1119,12 @@ class ModelHumanA4OLRM(nn.Module):
         num_views = render_c2ws.shape[1]
         output = []
         output_mask = []
+        # When return_gs_alpha is set, we also collect the raw gsplat
+        # comp_mask (the per-pixel accumulated opacity from the Gaussian
+        # rasterizer). This is the "true" alpha channel -- the
+        # output_mask above carries the *neural renderer's* mask, which is
+        # learned post-processing and does not necessarily resemble alpha.
+        output_gs_alpha = []
 
         # DEBUG
 
@@ -1185,6 +1212,24 @@ class ModelHumanA4OLRM(nn.Module):
                     torch.from_numpy(mask_boards / 255.0).float().unsqueeze(0)
                 )
 
+                if return_gs_alpha:
+                    # Raw gsplat alpha for this view (continuous, not the
+                    # neural mask). Same crop+place pipeline as the rgb
+                    # so it stays pixel-aligned to the rendered person.
+                    gs_alpha = _gs_alpha_to_2d(render_results["comp_mask"])
+                    gs_alpha = cv2.resize(
+                        gs_alpha,
+                        (int(_render_w / scale_x), int(_render_h / scale_y)),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    gs_alpha_board = np.zeros(boards.shape[:2], dtype=np.float32)
+                    gs_alpha_board[
+                        offset_y : offset_y + _h, offset_x : offset_x + _w
+                    ] = gs_alpha
+                    output_gs_alpha.append(
+                        torch.from_numpy(gs_alpha_board).float().unsqueeze(0)
+                    )
+
             else:
                 render_intr_view = render_intrs[:, view_idx : view_idx + 1]
                 intrs = render_intr_view
@@ -1243,12 +1288,21 @@ class ModelHumanA4OLRM(nn.Module):
                     torch.from_numpy(predict_mask / 255.0).float().unsqueeze(0)
                 )
 
+                if return_gs_alpha:
+                    gs_alpha = _gs_alpha_to_2d(render_results["comp_mask"])
+                    output_gs_alpha.append(
+                        torch.from_numpy(gs_alpha).float().unsqueeze(0)
+                    )
+
             del render_results
             torch.cuda.empty_cache()
 
         pred_rgbs = torch.cat(output, dim=0)
         pred_masks = torch.cat(output_mask, dim=0)
 
+        if return_gs_alpha:
+            pred_gs_alphas = torch.cat(output_gs_alpha, dim=0)
+            return pred_rgbs, pred_masks, pred_gs_alphas
         return pred_rgbs, pred_masks
 
     @torch.no_grad()

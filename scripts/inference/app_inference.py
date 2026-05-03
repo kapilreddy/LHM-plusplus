@@ -180,6 +180,10 @@ def inference_results(
 
     batch_rgb_list = []
     batch_mask_list = []
+    # Raw gsplat alpha (separate from the neural-renderer mask in
+    # batch_mask_list). Only populated when return_alpha=True so we don't
+    # pay the extra collect/concat for the rgb-only callers.
+    batch_gs_alpha_list = []
     num_batches = (video_size + batch_size - 1) // batch_size
 
     for batch_idx in range(0, video_size, batch_size):
@@ -228,22 +232,33 @@ def inference_results(
         if output_rgb is not None:
             anim_kwargs["output_rgb"] = output_rgb
 
-        batch_rgb, batch_mask = model.animation_infer(**anim_kwargs)
+        if return_alpha:
+            anim_kwargs["return_gs_alpha"] = True
+            batch_rgb, batch_mask, batch_gs_alpha = model.animation_infer(**anim_kwargs)
+            batch_gs_alpha_list.append(
+                (batch_gs_alpha.clamp(0, 1) * 255).to(torch.uint8).numpy()
+            )
+        else:
+            batch_rgb, batch_mask = model.animation_infer(**anim_kwargs)
         batch_rgb_list.append((batch_rgb.clamp(0, 1) * 255).to(torch.uint8).numpy())
         batch_mask_list.append((batch_mask.clamp(0, 1) * 255).to(torch.uint8).numpy())
     
     print("End of inference")
     
     rgb = np.concatenate(batch_rgb_list, axis=0)
-    # Mask comes back as (T, H, W, 1); squeeze the trailing singleton so
-    # callers can use it as a 2-D alpha plane directly.
+    # The neural mask is what visualized_center uses to find subject
+    # bounds. Squeeze the trailing channel dim so it's plain (T, H, W).
     mask = np.concatenate(batch_mask_list, axis=0)
     if mask.ndim == 4 and mask.shape[-1] == 1:
         mask = mask[..., 0]
+    # The raw gsplat alpha is what we hand back to callers asking for
+    # alpha-keyed output. Same shape contract as mask.
+    if return_alpha:
+        gs_alpha = np.concatenate(batch_gs_alpha_list, axis=0)
+        if gs_alpha.ndim == 4 and gs_alpha.shape[-1] == 1:
+            gs_alpha = gs_alpha[..., 0]
 
     if visualized_center:
-        # Use the (T, H, W) plane to find subject bounds, then apply the
-        # same crop to both rgb and mask so they stay aligned.
         h_indices, w_indices = np.where(mask > 0.25)[1:]
         if len(h_indices) > 0 and len(w_indices) > 0:
             top, bottom = h_indices.min(), h_indices.max()
@@ -260,7 +275,9 @@ def inference_results(
 
             rgb = rgb[:, top_new:bottom_new, left_new:right_new]
             mask = mask[:, top_new:bottom_new, left_new:right_new]
+            if return_alpha:
+                gs_alpha = gs_alpha[:, top_new:bottom_new, left_new:right_new]
 
     if return_alpha:
-        return rgb, mask
+        return rgb, gs_alpha
     return rgb
