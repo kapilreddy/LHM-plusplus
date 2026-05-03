@@ -93,7 +93,8 @@ def inference_results(
     visualized_center: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
     device: str = "cuda",
-) -> np.ndarray:
+    return_alpha: bool = False,
+):
     """Run inference on a motion sequence with batching to prevent OOM.
 
     Args:
@@ -106,9 +107,17 @@ def inference_results(
         visualized_center: If True, crops output to subject bounds with 10% padding.
         batch_size: Number of frames to process in each batch.
         device: Device to run inference on.
+        return_alpha: If True, also return the per-frame alpha mask the
+            renderer already produces, so callers can composite the person
+            onto an arbitrary background instead of the baked-in white.
+            The mask is the same one used internally for visualized_center
+            cropping; opt-in keeps the existing rgb-only callers working.
 
     Returns:
-        Rendered RGB frames as numpy array of shape (T, H, W, 3).
+        If return_alpha is False (default): rendered RGB frames as a
+        numpy array of shape (T, H, W, 3) -- backward-compatible.
+        If return_alpha is True: tuple (rgb, alpha) where alpha has shape
+        (T, H, W) in the same uint8 [0, 255] range as rgb.
     """
     offset_list = motion_seq.get("offset_list")
     ori_h, ori_w = motion_seq.get("ori_size", (512, 512))
@@ -225,10 +234,17 @@ def inference_results(
     
     print("End of inference")
     
-    if visualized_center:
-        mask_numpy = np.concatenate(batch_mask_list, axis=0)
-        h_indices, w_indices = np.where(mask_numpy > 0.25)[1:]
+    rgb = np.concatenate(batch_rgb_list, axis=0)
+    # Mask comes back as (T, H, W, 1); squeeze the trailing singleton so
+    # callers can use it as a 2-D alpha plane directly.
+    mask = np.concatenate(batch_mask_list, axis=0)
+    if mask.ndim == 4 and mask.shape[-1] == 1:
+        mask = mask[..., 0]
 
+    if visualized_center:
+        # Use the (T, H, W) plane to find subject bounds, then apply the
+        # same crop to both rgb and mask so they stay aligned.
+        h_indices, w_indices = np.where(mask > 0.25)[1:]
         if len(h_indices) > 0 and len(w_indices) > 0:
             top, bottom = h_indices.min(), h_indices.max()
             left, right = w_indices.min(), w_indices.max()
@@ -242,11 +258,9 @@ def inference_results(
             left_new = max(0, int(center_x - new_width / 2))
             right_new = int(center_x + new_width / 2)
 
-            rgb = np.concatenate(batch_rgb_list, axis=0)
-            output = rgb[:, top_new:bottom_new, left_new:right_new]
-        else:
-            output = np.concatenate(batch_rgb_list, axis=0)
-    else:
-        output = np.concatenate(batch_rgb_list, axis=0)
+            rgb = rgb[:, top_new:bottom_new, left_new:right_new]
+            mask = mask[:, top_new:bottom_new, left_new:right_new]
 
-    return output
+    if return_alpha:
+        return rgb, mask
+    return rgb
